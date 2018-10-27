@@ -26,7 +26,7 @@ var (
 
 const (
 	//BlockSize .
-	BlockSize int64 = 100 * 1024 * 1024
+	BlockSize int64 = 2 * 1024 * 1024
 	//FilePath .
 	FilePath string = "./tmp"
 )
@@ -39,6 +39,7 @@ type DL struct {
 	Elapse        time.Duration
 	HTTPClient    *http.Client
 	ContentLength int64
+	Downloaded    int64
 	FileName      string
 	CNT           int
 	Blocks        [][]int64
@@ -46,12 +47,13 @@ type DL struct {
 	WG            sync.WaitGroup
 }
 
-func getDL(url string) *DL {
-	log.Println(url)
+func getDL(url string, concurrent int) *DL {
+	log.Println("Downloading: ", url)
 	return &DL{
 		URL: url,
+		CNT: concurrent,
 		HTTPClient: &http.Client{
-			Timeout: 5 * time.Second,
+			Timeout: 300 * time.Second, // 5 min 超时
 		},
 	}
 }
@@ -67,6 +69,7 @@ func (dl *DL) init() (e error) {
 		req  *http.Request
 		resp *http.Response
 	)
+
 	dl.Start = time.Now()
 	req, e = http.NewRequest("HEAD", dl.URL, nil)
 	if e != nil {
@@ -85,6 +88,8 @@ func (dl *DL) init() (e error) {
 		dl.AcceptRange = true
 	}
 
+	dl.parseFileName(resp.Header)
+
 	//init dir
 	_, e = os.Stat(FilePath)
 	if e != nil {
@@ -92,8 +97,11 @@ func (dl *DL) init() (e error) {
 			log.Panicln(e)
 		}
 	}
+	if _, e = os.Stat(FilePath + "/" + dl.FileName); !os.IsNotExist(e) {
+		log.Println("File Exists ", FilePath+"/"+dl.FileName)
+		os.Exit(0)
+	}
 
-	dl.parseFileName(resp.Header)
 	if dl.AcceptRange {
 		dl.parseBlocks()
 		dl.parseFileHandle()
@@ -106,7 +114,8 @@ func (dl *DL) parseFileHandle() {
 	for i := 0; i < len(dl.Blocks); i++ {
 		suffix := fmt.Sprintf("%d_%d", dl.Blocks[i][0], dl.Blocks[i][1])
 		fileNameStr := FilePath + "/" + dl.FileName + "_" + suffix
-		file, e := os.OpenFile(fileNameStr, os.O_RDONLY|os.O_APPEND, 0777)
+		//file, e := os.OpenFile(fileNameStr, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
+		file, e := os.OpenFile(fileNameStr, os.O_RDWR|os.O_APPEND, 0666)
 		if e == nil {
 			fs, e := file.Stat()
 			if e == nil {
@@ -126,18 +135,33 @@ func (dl *DL) parseFileHandle() {
 }
 
 func (dl *DL) parseBlocks() {
-	dl.CNT = int(math.Ceil(float64(dl.ContentLength / BlockSize)))
+	var (
+		sizePerBlock int64
+		lastBlock    int64
+	)
+	cnt := int64(dl.CNT)
+	sizePerBlock = int64(math.Floor(float64((dl.ContentLength / cnt))))
+	if dl.ContentLength%cnt != 0 {
+		lastBlock = dl.ContentLength % cnt
+	}
 	var start int64
 	for i := 0; i < dl.CNT; i++ {
-		if i != dl.CNT-1 {
-			block := []int64{
-				start,
-				start + BlockSize - 1,
-			}
-			dl.Blocks = append(dl.Blocks, block)
-			start += BlockSize
+		block := []int64{
+			start,
+			start + sizePerBlock - 1,
 		}
+		dl.Blocks = append(dl.Blocks, block)
+		start += sizePerBlock
 	}
+
+	if lastBlock != 0 {
+		lastBlock := []int64{
+			start,
+			start + lastBlock,
+		}
+		dl.Blocks = append(dl.Blocks, lastBlock)
+	}
+
 }
 
 func (dl *DL) parseFileName(h http.Header) {
@@ -168,8 +192,9 @@ func (dl *DL) download(index int) {
 		//Already Finish this block
 		return
 	}
+	shouldWrite := dl.Blocks[index][1] - dl.Blocks[index][0] + 1
+	//log.Println("Starting download block no.", index)
 
-	//TODO 关闭文件
 	defer dl.Handlers[index].Close()
 
 	_range := fmt.Sprintf("%d-%d", dl.Blocks[index][0], dl.Blocks[index][1])
@@ -186,12 +211,21 @@ func (dl *DL) download(index int) {
 	defer resp.Body.Close()
 	written, e = io.Copy(dl.Handlers[index], resp.Body)
 	if e != nil {
+		log.Println("Copy Err")
 		goto ERR
 	}
-	if (dl.Blocks[index][1] - dl.Blocks[index][0] + 1) != written {
+	if written == 0 {
+		log.Println("Write 0 byte")
 		goto ERR
 	}
-	log.Println("Finished no.", index, " block")
+
+	if shouldWrite-written > 1 {
+		log.Println("Write Less ", shouldWrite, written)
+		goto ERR
+	}
+	// atomic.AddInt64(&dl.Downloaded, written)
+	// log.Println("dl", atomic.LoadInt64(&dl.Downloaded))
+	//log.Println("Finished no.", index, " block")
 	return
 
 ERR:
@@ -213,7 +247,7 @@ func (dl *DL) mergeFile() {
 	}
 	for i := 0; i < len(dl.Handlers); i++ {
 		tmpFile := dl.Handlers[i].Name()
-		log.Println(tmpFile)
+		//log.Println(tmpFile)
 		src, e = os.Open(tmpFile)
 		if e != nil {
 			goto ERR
@@ -223,7 +257,7 @@ func (dl *DL) mergeFile() {
 			goto ERR
 		}
 		//TODO Written WRONG
-		log.Println("Merged no.", i)
+		//log.Println("Merged no.", i)
 	}
 	return
 ERR:
@@ -245,17 +279,36 @@ ERR:
 	log.Panicln("End Fail", e)
 }
 
+// func (dl *DL) showProgress() {
+// 	//time.Sleep(time.Second)
+// 	// uiprogress.Start()
+// 	// bar := uiprogress.AddBar(100)
+// 	// bar.AppendCompleted()
+// 	// bar.PrependElapsed()
+
+// 	for dl.Downloaded <= dl.ContentLength {
+// 		//percent := math.Floor((float64(dl.Downloaded) / float64(dl.ContentLength)) * 100)
+// 		log.Println(atomic.LoadInt64(&dl.Downloaded), dl.ContentLength)
+// 		// bar.Set(int(percent))
+
+// 		time.Sleep(1 * time.Second)
+// 	}
+// 	//bar.Set(100)
+// }
+
 func main() {
 	var (
-		link = ""
-		e    error
+		concurrent = 10
+		link       = ""
+		e          error
 	)
-	flag.StringVar(&link, "link", "", "which stuff you want to download ? Give Me Link ")
+	flag.StringVar(&link, "l", "", "which stuff you want to download ? Give Me Link ")
+	flag.IntVar(&concurrent, "c", 10, "how many download concurrent in same time")
 	flag.Parse()
 	if link == "" {
 		printUsage()
 	}
-	dl := getDL(link)
+	dl := getDL(link, concurrent)
 	e = dl.init()
 	if e != nil {
 		goto ERR

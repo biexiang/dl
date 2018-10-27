@@ -1,11 +1,24 @@
 ## Go下载客户端 
++ 使用 
 
-### TODO
-+ 提供一个下载链接
-    -   判断下载资源、下载类型
-    -   是否支持分块下载
-    -   下载中断后能够断点续传，不用重新下载
-        *   中断后继续下载，初始化检查文件块，调整offset 
-        *   文件句柄存起来，为了不去目录下扫
-    -   先不考虑不支持range的情况
-    -   下载是没有顺序的，内容拼凑需要按照顺序来进行
+        ./dlclient -l=http://dl.net/download/fs.mkv -c=200
+
+        2018/10/27 16:34:59 Downloading:  http://dl.net/download/fs.mkv
+        2018/10/27 16:35:02 Download Succeed  2.755458159s
+
++ 支持指定开启并行协程数进行下载
++ 支持断点续传、分块下载
++ Nginx 限速测试
+
+        server {
+            listen 80; 
+            server_name dl.net;
+
+            location /download {
+                limit_rate_after 1m;
+                limit_rate 500k;
+                alias        /Users/poly/Downloads/Cut/;
+                index        index.html;
+            }
+
+        }
